@@ -295,12 +295,14 @@ impl Pages {
             // every kind of texture (resource heap tier 2: the only flags for both)
             Flags: D3D12_HEAP_FLAG_NONE,
         };
-        let mut heap: Option<ID3D12Heap> = None;
-        if let Err(e) = super::title_textures::own_work(|| dev.CreateHeap(&desc, &mut heap)) {
-            crate::xlog_warn!("D3D12.X: no video memory for more pages of title textures ({e})");
-            return None;
-        }
-        self.pools.push(heap?);
+        let heap = match super::real::create_tile_pool(dev, &desc) {
+            Ok(heap) => heap?,
+            Err(e) => {
+                crate::xlog_warn!("D3D12.X: no video memory for more pages of title textures ({e})");
+                return None;
+            }
+        };
+        self.pools.push(heap);
         let h = self.pools.len() as u32 - 1;
         self.free.extend((1..POOL_PAGES).rev().map(|t| (h, t)));
         Some((h, 0))

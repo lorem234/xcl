@@ -578,12 +578,13 @@ impl State {
             Alignment: 0,
             Flags: D3D12_HEAP_FLAG_DENY_RT_DS_TEXTURES | D3D12_HEAP_FLAG_DENY_NON_RT_DS_TEXTURES,
         };
-        let mut heap: Option<ID3D12Heap> = None;
-        if let Err(e) = super::title_textures::own_work(|| self.dev.CreateHeap(&desc, &mut heap)) {
-            crate::xlog_warn!("sparse windows: no video memory for more tiles ({e})");
-            return None;
-        }
-        let heap = heap?;
+        let heap = match super::real::create_tile_pool(&self.dev, &desc) {
+            Ok(heap) => heap?,
+            Err(e) => {
+                crate::xlog_warn!("sparse windows: no video memory for more tiles ({e})");
+                return None;
+            }
+        };
         let h = match self.pools.iter().position(|p| p.is_none()) {
             Some(i) => {
                 self.pools[i] = Some(heap);

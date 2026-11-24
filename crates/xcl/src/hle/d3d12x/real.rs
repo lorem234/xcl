@@ -410,18 +410,75 @@ pub fn device_raw() -> *mut c_void {
 
 /// The process's video memory on the device's adapter: (local, non-local) bytes in use.
 pub fn video_memory() -> Option<(u64, u64)> {
-    use windows::Win32::Graphics::Dxgi::*;
     let raw = device_raw();
     let dev = unsafe { ID3D12Device::from_raw_borrowed(&raw) }?;
-    unsafe {
-        let luid = dev.GetAdapterLuid();
-        let factory: IDXGIFactory4 = CreateDXGIFactory1().ok()?;
-        let adapter: IDXGIAdapter3 = factory.EnumAdapterByLuid(luid).ok()?;
-        let mut local = DXGI_QUERY_VIDEO_MEMORY_INFO::default();
-        let mut non_local = DXGI_QUERY_VIDEO_MEMORY_INFO::default();
-        adapter.QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &mut local).ok()?;
-        adapter.QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, &mut non_local).ok()?;
-        Some((local.CurrentUsage, non_local.CurrentUsage))
+    let (local, non_local) = unsafe { video_memory_info(dev) }?;
+    Some((local.CurrentUsage, non_local.CurrentUsage))
+}
+
+unsafe fn video_memory_info(dev: &ID3D12Device) -> Option<(DXGI_QUERY_VIDEO_MEMORY_INFO, DXGI_QUERY_VIDEO_MEMORY_INFO)> {
+    let luid = dev.GetAdapterLuid();
+    let factory: IDXGIFactory4 = CreateDXGIFactory1().ok()?;
+    let adapter: IDXGIAdapter3 = factory.EnumAdapterByLuid(luid).ok()?;
+    let mut local = DXGI_QUERY_VIDEO_MEMORY_INFO::default();
+    let mut non_local = DXGI_QUERY_VIDEO_MEMORY_INFO::default();
+    adapter.QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &mut local).ok()?;
+    adapter.QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, &mut non_local).ok()?;
+    Some((local, non_local))
+}
+
+fn tile_pool_uses_shared(local: DXGI_QUERY_VIDEO_MEMORY_INFO, limit: u64, size: u64) -> bool {
+    local.CurrentUsage.saturating_add(size) > local.Budget.min(limit)
+}
+
+/// With an explicit local-memory limit, place new tile pools in GPU-visible system memory
+/// when the process is near that limit. Existing mappings and all non-tile heaps are unaffected.
+pub(super) unsafe fn create_tile_pool(dev: &ID3D12Device, desc: &D3D12_HEAP_DESC) -> windows::core::Result<Option<ID3D12Heap>> {
+    static LIMIT: OnceLock<Option<u64>> = OnceLock::new();
+    static LOG_SHARED_POOL: std::sync::Once = std::sync::Once::new();
+    let limit = *LIMIT.get_or_init(|| {
+        std::env::var("XCL_TILE_LOCAL_MB").ok()?.trim().parse::<u64>().ok()?.checked_mul(1 << 20)
+    });
+    let create = |desc: &D3D12_HEAP_DESC| -> windows::core::Result<Option<ID3D12Heap>> {
+        let mut heap: Option<ID3D12Heap> = None;
+        super::title_textures::own_work(|| dev.CreateHeap(desc, &mut heap))?;
+        Ok(heap)
+    };
+    let Some(limit) = limit else { return create(desc) };
+    let Some((local, non_local)) = video_memory_info(dev) else { return create(desc) };
+    if non_local.Budget == 0 {
+        return create(desc);
+    }
+    let mut shared = *desc;
+    shared.Properties.Type = D3D12_HEAP_TYPE_CUSTOM;
+    shared.Properties.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_NOT_AVAILABLE;
+    shared.Properties.MemoryPoolPreference = D3D12_MEMORY_POOL_L0;
+    let create_shared = || {
+        let heap = create(&shared)?;
+        LOG_SHARED_POOL.call_once(|| crate::xlog_info!("D3D12.X: backing new tile pools with shared system memory"));
+        Ok(heap)
+    };
+    if tile_pool_uses_shared(local, limit, desc.SizeInBytes) {
+        return create_shared().or_else(|_| create(desc));
+    }
+    match create(desc) {
+        Err(e) if e.code().0 == crate::util::E_OUTOFMEMORY => create_shared(),
+        result => result,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tile_pool_uses_the_tighter_local_limit() {
+        let mut local = DXGI_QUERY_VIDEO_MEMORY_INFO { CurrentUsage: 400, Budget: 600, ..Default::default() };
+        assert!(!tile_pool_uses_shared(local, 500, 100));
+        assert!(tile_pool_uses_shared(local, 500, 101));
+        local.Budget = 450;
+        assert!(tile_pool_uses_shared(local, 500, 51));
+        assert!(!tile_pool_uses_shared(local, 500, 50));
     }
 }
 

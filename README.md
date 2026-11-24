@@ -143,6 +143,11 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
   `pls\` (the title's `S:\`), `temp\` (`T:\`), `cache\`, `logs\xcl.log`, `logs\report.json` (the
   previous run's: `xcl.prev.log`, `report.prev.json`).
 
+- On a discrete GPU, set `XCL_TILE_LOCAL_MB` to reserve some video memory for other graphics
+  allocations. XCL uses shared system memory for new tile heaps when allocating them would exceed
+  that limit (in MiB) or the Windows video memory budget. This can increase system memory use and
+  slow down GPU access to tiled resources.
+
 ## Tests
 
 ```powershell
