@@ -1,8 +1,8 @@
-name: Upstream Windows package
+name: Series S Windows test package
 
 on:
   push:
-    branches: [build-upstream-windows]
+    branches: [codex/xcl-series-s-build]
   workflow_dispatch:
 
 permissions:
@@ -20,12 +20,25 @@ jobs:
       run:
         shell: pwsh
     steps:
-      # Build the original repository, not the branch containing this workflow.
+      # Keep the tested upstream baseline and apply only the reviewed Series S change.
       - uses: actions/checkout@v6
         with:
           repository: ivall/xcl
           ref: 64b3f35599bb7102f55d640e1a791e7d6dd3b175
           persist-credentials: false
+
+      - name: Apply the pinned Series S render-target change
+        run: |
+          $patchCommit = 'c3d350a5729d7559d00554facc622c6d1c1b9bb6'
+          $patchPath = Join-Path $env:RUNNER_TEMP 'series-s-format.patch'
+          git fetch --no-tags --depth 2 origin $patchCommit
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          git diff --binary "--output=$patchPath" "${patchCommit}^" $patchCommit -- crates/xcl/src/hle/d3d12x/device_x.rs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          git apply --index $patchPath
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          git diff --cached --check
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Select stable Windows Rust
         run: |
@@ -35,17 +48,20 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           rustc --version
 
-      - name: Build unmodified upstream release
+      - name: Test the format change
         run: |
-          git diff --exit-code
+          cargo test --locked --release -p xcl --lib hle::d3d12x::device_x::tests::console_types_and_descs_become_pc_ones -- --exact
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Build patched upstream release
+        run: |
           cargo build --locked --release --workspace
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Package executable and Microsoft runtimes
         run: |
           $ErrorActionPreference = 'Stop'
-          $package = Join-Path $env:GITHUB_WORKSPACE 'target/package/xcl-upstream-windows-x64'
+          $package = Join-Path $env:GITHUB_WORKSPACE 'target/package/xcl-series-s-windows-x64'
           $downloads = Join-Path $env:GITHUB_WORKSPACE 'target/runtime-downloads'
           New-Item -ItemType Directory -Path $package, $downloads -Force | Out-Null
 
@@ -84,20 +100,25 @@ jobs:
           foreach ($name in @('README.md', 'LICENSE', 'THIRD_PARTY.md')) {
             Copy-Item -LiteralPath $name -Destination $package
           }
-          git archive --format=zip "--output=$package/source.zip" HEAD
+          $sourceTree = git write-tree
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          git archive --format=zip "--output=$package/source.zip" $sourceTree
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $commit = git rev-parse HEAD
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           @"
-          XCL upstream Windows x64 build
+          XCL Series S Windows x64 test build
           Original source: https://github.com/ivall/xcl
-          Source commit: $commit
+          Upstream commit: $commit
+          Series S patch: https://github.com/ivall/xcl/pull/605
+          Patch commit: c3d350a5729d7559d00554facc622c6d1c1b9bb6
+          Source tree: $sourceTree
 
           Extract the entire ZIP into a new folder and double-click xcl.exe.
           From PowerShell: .\xcl.exe run 'D:\Game'
           Keep the DLLs and D3D12 folder alongside xcl.exe.
 
-          This builds unmodified upstream source; it includes none of our former patches.
+          To test Series S mode, set device_type = "lockhart" in the title xcl.toml.
           Rust, Visual Studio, and the Windows SDK are not required to use this package.
           Windows 10/11 x64, Gaming Services, and a supported D3D12 GPU are still required.
           Game files are not included. Compatibility depends on the title and hardware.
@@ -106,13 +127,13 @@ jobs:
           Their original license notices are in licenses/. Corresponding XCL source is
           included as source.zip. Debugging symbols are a separate build artifact.
           "@ | Set-Content -LiteralPath "$package/START-HERE.txt" -Encoding utf8
-          "Source commit: $commit" >> $env:GITHUB_STEP_SUMMARY
+          "Upstream commit: $commit, Series S patch: c3d350a5729d7559d00554facc622c6d1c1b9bb6, source tree: $sourceTree" >> $env:GITHUB_STEP_SUMMARY
 
       - name: Check executable startup and DXC compilation
         run: |
-          & ./target/package/xcl-upstream-windows-x64/xcl.exe --version
+          & ./target/package/xcl-series-s-windows-x64/xcl.exe --version
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          & ./target/package/xcl-upstream-windows-x64/xcl.exe --help
+          & ./target/package/xcl-series-s-windows-x64/xcl.exe --help
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $shader = 'RWStructuredBuffer<uint> output : register(u0); [numthreads(1,1,1)] void main(uint3 id : SV_DispatchThreadID) { output[id.x] = 42; }'
           [IO.File]::WriteAllText((Join-Path $env:GITHUB_WORKSPACE 'target/shader-smoke.hlsl'), $shader)
@@ -122,15 +143,15 @@ jobs:
       - name: Upload Windows package
         uses: actions/upload-artifact@v4
         with:
-          name: xcl-upstream-windows-x64
-          path: target/package/xcl-upstream-windows-x64/
+          name: xcl-series-s-windows-x64
+          path: target/package/xcl-series-s-windows-x64/
           if-no-files-found: error
           retention-days: 30
 
       - name: Upload debugging symbols
         uses: actions/upload-artifact@v4
         with:
-          name: xcl-upstream-symbols
+          name: xcl-series-s-symbols
           path: target/release/xcl.pdb
           if-no-files-found: error
           retention-days: 30
