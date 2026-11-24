@@ -1,0 +1,136 @@
+name: XCL memory test package
+
+on:
+  push:
+    branches: [codex/xcl-memory-build]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: windows-2025
+    timeout-minutes: 30
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_INCREMENTAL: 0
+      RUSTFLAGS: -C target-feature=+crt-static
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Select stable Windows Rust
+        run: |
+          rustup toolchain install stable-x86_64-pc-windows-msvc --profile minimal --no-self-update
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          rustup default stable-x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          rustc --version
+
+      - name: Test the tile memory selection
+        run: |
+          cargo test --locked --release -p xcl --lib hle::d3d12x::real::tests::tile_pool_uses_the_tighter_local_limit -- --exact
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Build XCL release
+        run: |
+          cargo build --locked --release --workspace
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Package executable and Microsoft runtimes
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $package = Join-Path $env:GITHUB_WORKSPACE 'target/package/xcl-memory-windows-x64'
+          $downloads = Join-Path $env:GITHUB_WORKSPACE 'target/runtime-downloads'
+          New-Item -ItemType Directory -Path $package, $downloads -Force | Out-Null
+
+          function Get-VerifiedArchive($Url, $Name, $Sha256) {
+            $archive = Join-Path $downloads "$Name.zip"
+            Invoke-WebRequest -Uri $Url -OutFile $archive
+            if ((Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash -ne $Sha256) {
+              throw "SHA256 mismatch for $Name"
+            }
+            $expanded = Join-Path $downloads $Name
+            Expand-Archive -LiteralPath $archive -DestinationPath $expanded -Force
+            return $expanded
+          }
+
+          $dxc = Get-VerifiedArchive `
+            'https://github.com/microsoft/DirectXShaderCompiler/releases/download/v1.9.2609/dxc_2026_09_29.zip' `
+            'dxc-1.9.2609' `
+            'ad31b1fc8443175d204f77a611fdb3ef2ec42759bdc2f1167368de24a4a7e7f1'
+          $agility = Get-VerifiedArchive `
+            'https://api.nuget.org/v3-flatcontainer/microsoft.direct3d.d3d12/1.620.2/microsoft.direct3d.d3d12.1.620.2.nupkg' `
+            'agility-1.620.2' `
+            '70489669c2bbeaf318b62d72b0ac3e753d521387bfc848c9763791c4e920bfcc'
+
+          Copy-Item -LiteralPath 'target/release/xcl.exe' -Destination $package
+          foreach ($dll in @('dxcompiler.dll', 'dxil.dll')) {
+            Copy-Item -LiteralPath (Join-Path $dxc "bin/x64/$dll") -Destination $package
+          }
+          New-Item -ItemType Directory -Path "$package/D3D12", "$package/licenses/DXC", "$package/licenses/Agility" -Force | Out-Null
+          foreach ($dll in @('D3D12Core.dll', 'd3d12SDKLayers.dll')) {
+            Copy-Item -LiteralPath (Join-Path $agility "build/native/bin/x64/$dll") -Destination "$package/D3D12"
+          }
+          Get-ChildItem -LiteralPath $dxc -File | Where-Object { $_.Name -match 'LICENSE|NOTICE' } |
+            Copy-Item -Destination "$package/licenses/DXC"
+          Get-ChildItem -LiteralPath $agility -File | Where-Object { $_.Name -match 'LICENSE|NOTICE' } |
+            Copy-Item -Destination "$package/licenses/Agility"
+          foreach ($name in @('README.md', 'LICENSE', 'THIRD_PARTY.md')) {
+            Copy-Item -LiteralPath $name -Destination $package
+          }
+          git archive --format=zip "--output=$package/source.zip" HEAD
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $commit = git rev-parse HEAD
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          @"
+          XCL Windows tile-memory test build
+          Source: https://github.com/lorem234/xcl/tree/codex/xcl-memory-build
+          Source commit: $commit
+
+          Extract the entire ZIP into a new folder and double-click xcl.exe.
+          From PowerShell: .\xcl.exe run 'D:\Game'
+          Keep the DLLs and D3D12 folder alongside xcl.exe.
+
+          Set XCL_TILE_LOCAL_MB to opt in to the shared-memory tile heaps.
+          Rust, Visual Studio, and the Windows SDK are not required to use this package.
+          Windows 10/11 x64, Gaming Services, and a supported D3D12 GPU are still required.
+          Game files are not included. Compatibility depends on the title and hardware.
+
+          Bundled runtimes: Microsoft DXC 1.9.2609 and Direct3D Agility SDK 1.620.2.
+          Their original license notices are in licenses/. Corresponding XCL source is
+          included as source.zip. Debugging symbols are a separate build artifact.
+          "@ | Set-Content -LiteralPath "$package/START-HERE.txt" -Encoding utf8
+          "Source commit: $commit" >> $env:GITHUB_STEP_SUMMARY
+
+      - name: Check executable startup and DXC compilation
+        run: |
+          & ./target/package/xcl-memory-windows-x64/xcl.exe --version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & ./target/package/xcl-memory-windows-x64/xcl.exe --help
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $shader = 'RWStructuredBuffer<uint> output : register(u0); [numthreads(1,1,1)] void main(uint3 id : SV_DispatchThreadID) { output[id.x] = 42; }'
+          [IO.File]::WriteAllText((Join-Path $env:GITHUB_WORKSPACE 'target/shader-smoke.hlsl'), $shader)
+          & ./target/runtime-downloads/dxc-1.9.2609/bin/x64/dxc.exe -T cs_6_6 -E main -Fo target/shader-smoke.dxil target/shader-smoke.hlsl
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Upload Windows package
+        uses: actions/upload-artifact@v4
+        with:
+          name: xcl-memory-windows-x64
+          path: target/package/xcl-memory-windows-x64/
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload debugging symbols
+        uses: actions/upload-artifact@v4
+        with:
+          name: xcl-memory-symbols
+          path: target/release/xcl.pdb
+          if-no-files-found: error
+          retention-days: 30
